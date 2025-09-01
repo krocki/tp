@@ -1,3 +1,16 @@
+/**
+ * MOE Test 0: Tensor Parallel Mixture of Experts Implementation
+ * 
+ * This file implements a tensor parallel (TP) version of a Mixture of Experts (MOE) block
+ * without MPI support. It uses local threading for parallelism and processes single tokens.
+ * 
+ * Key Features:
+ * - Tensor parallelism using local threads (no MPI)
+ * - Single token processing (batch_size = 1)
+ * - MOE with top-k expert selection
+ * - Performance profiling and correctness validation
+ */
+
 #include <chrono>
 #include <iostream>
 #include <cassert>
@@ -8,50 +21,63 @@
 #include <cstring>
 #include <thread>
 
-// Hardcoded config
+/**
+ * Configuration for the MOE transformer block
+ * Defines model dimensions and expert configuration
+ */
 struct QwenConfig {
-  int d_model = 2048;
-  int d_ff = 768;
-  int n_experts = 128;
-  int top_k = 8;
+  int d_model = 2048;    // Model hidden dimension
+  int d_ff = 768;        // Feed-forward dimension (per expert)
+  int n_experts = 128;   // Total number of experts
+  int top_k = 8;         // Number of experts to activate per token
 };
 
-// Layer weights struct (simplified, no biases)
+/**
+ * MOE layer weights structure (simplified, no biases)
+ * Contains all the weight matrices needed for the MOE computation
+ */
 struct QwenLayerWeights {
-  float* router_w = nullptr;  // [n_experts * d_model] (row-major, rows=n_experts, cols=d_model)
-  float** Wg = nullptr;       // Array of [d_ff * d_model] (rows=d_ff, cols=d_model) per expert
-  float** Wu = nullptr;
-  float** Wd = nullptr;       // [d_model * d_ff] (rows=d_model, cols=d_ff)
+  float* router_w = nullptr;  // Router weights [n_experts × d_model] - routes tokens to experts
+  float** Wg = nullptr;       // Gate projection weights per expert [d_model × d_ff]
+  float** Wu = nullptr;       // Up projection weights per expert [d_model × d_ff]  
+  float** Wd = nullptr;       // Down projection weights per expert [d_ff × d_model]
 };
 
-// Tensor shard struct: represents a 2D tensor (row-major flat array)
+/**
+ * 2D tensor representation with row-major storage
+ * Used to represent weight matrix shards in tensor parallel execution
+ */
 struct Tensor2D {
-  float* data;  // Flat data pointer
-  int rows;     // Number of rows
-  int cols;     // Number of columns
+  float* data;  // Flat data pointer to weight values
+  int rows;     // Number of rows in the tensor
+  int cols;     // Number of columns in the tensor
 
   // Constructor
   Tensor2D(float* d = nullptr, int r = 0, int c = 0) : data(d), rows(r), cols(c) {}
 
-  // Size in elements
+  // Get total number of elements
   size_t size() const { return static_cast<size_t>(rows) * cols; }
 
-  // Access element (i,j)
+  // Access element at position (i,j)
   float& at(int i, int j) { return data[i * cols + j]; }
   const float& at(int i, int j) const { return data[i * cols + j]; }
 };
 
-// Profiling struct to hold timings
+/**
+ * Performance profiler for timing different components of MOE computation
+ * Tracks time spent in each phase of the forward pass
+ */
 struct Profiler {
-  double router_time = 0.0;
-  double topk_time = 0.0;
-  double gate_proj_time = 0.0;
-  double up_proj_time = 0.0;
-  double silu_mul_time = 0.0;
-  double down_proj_time = 0.0;
-  double comm_time = 0.0;  // Only for TP (reduce)
-  double total_time = 0.0;
+  double router_time = 0.0;      // Time spent in router computation
+  double topk_time = 0.0;        // Time spent in top-k expert selection
+  double gate_proj_time = 0.0;   // Time spent in gate projections
+  double up_proj_time = 0.0;     // Time spent in up projections
+  double silu_mul_time = 0.0;    // Time spent in SiLU activation and multiplication
+  double down_proj_time = 0.0;   // Time spent in down projections
+  double comm_time = 0.0;        // Time spent in communication (MPI reduce operations)
+  double total_time = 0.0;       // Total computation time
 
+  // Print detailed timing breakdown
   void print(const std::string& prefix) const {
     std::cout << prefix << " Breakdown:" << std::endl;
     std::cout << "  Router: " << router_time << "s" << std::endl;
@@ -65,7 +91,15 @@ struct Profiler {
   }
 };
 
-// Serial matmul: C = A * B (m x k) * (k x n) -> (m x n)
+/**
+ * Basic matrix multiplication: C = A * B
+ * @param A Input matrix A [m × k]
+ * @param B Input matrix B [k × n] 
+ * @param C Output matrix C [m × n]
+ * @param m Number of rows in A and C
+ * @param n Number of columns in B and C
+ * @param k Number of columns in A and rows in B
+ */
 void serial_matmul(const float* A, const float* B, float* C, int m, int n, int k) {
   for (int i = 0; i < m; ++i) {
     for (int j = 0; j < n; ++j) {
@@ -78,16 +112,28 @@ void serial_matmul(const float* A, const float* B, float* C, int m, int n, int k
   }
 }
 
-// SiLU activation in-place
+/**
+ * SiLU (Swish) activation function applied in-place: x = x / (1 + exp(-x))
+ * @param x Input/output array to apply activation to
+ * @param n Number of elements in the array
+ */
 void silu(float* x, int n) {
   for (int i = 0; i < n; ++i) {
     x[i] = x[i] / (1.0f + expf(-x[i]));
   }
 }
 
-// Top-k selection with softmax normalization (modifies logits in-place for top-k, uses scratch for copy)
+/**
+ * Top-k expert selection with softmax normalization
+ * Selects the k experts with highest routing logits and normalizes their weights
+ * @param logits Router logits [n_experts] (modified in-place for top-k)
+ * @param indices Output array for selected expert indices [k]
+ * @param k Number of experts to select
+ * @param n Total number of experts
+ * @param scratch Temporary buffer [n_experts] for computation
+ */
 void topk(float* logits, int* indices, int k, int n, float* scratch) {
-  // Copy logits to scratch
+  // Copy logits to scratch to preserve original values during sorting
   memcpy(scratch, logits, n * sizeof(float));
 
   // Pair values with indices
